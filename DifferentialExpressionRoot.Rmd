@@ -1,0 +1,1093 @@
+---
+title: "Differential Expression - Root"
+author: "Steve Pederson"
+date: '`r format(Sys.Date(), "%a %b %d, %Y")`'
+output: 
+  pdf_document: 
+    fig_caption: yes
+    number_sections: yes
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, include = TRUE,
+                      fig.width = 7, fig.height = 6,
+                      message = FALSE, warning = FALSE,
+                      error = FALSE)
+```
+
+# Setup
+
+## Load R Packages
+
+```{r loadPackages}
+library(dplyr)
+library(magrittr)
+library(readr)
+library(tibble)
+library(pander)
+library(SRAdb)
+library(fastqcWrap)
+library(NGS2R)
+library(scales)
+library(reshape2)
+library(parallel)
+library(grid)
+library(stringr)
+library(edgeR)
+library(ggplot2)
+library(ggrepel)
+library(limma)
+library(GenomicRanges)
+library(rtracklayer)
+```
+
+
+## Define Bash Variables
+
+Any variables for use in both `bash` and `R` were then defined, checked then exported as `Environment Variables.`
+
+```{r setBashVars}
+GENOME <- file.path("/home", "steveped", "genomes", "Hordeum_vulgare/Hordeum_vulgare.ASM32608v1")
+bashVars <- list(
+    N_CORES = 16,
+    SAMTOOLS = file.path("/opt", "samtools", "bin", "samtools"),
+    HISAT2 = file.path("/opt", "hisat2-2.0.4", "hisat2"),
+    STRINGTIE = file.path("/usr", "local", "bin", "stringtie"),
+    FEATURECOUNTS = file.path("/opt", "subread-1.5.1-source", "bin", "featureCounts"),
+    GENOME = GENOME,
+    SPLICEFILE = paste0(GENOME, ".34.splicesites.txt"),
+    GFF = paste0(GENOME, ".34.chr.gff3")
+  )
+```
+
+```{r checkBashVars, message=TRUE, echo=FALSE}
+message("Checking file paths...")
+checks <- with(bashVars,
+               c(
+                 SAMTOOLS = file.exists(SAMTOOLS),
+                 HISAT2 = file.exists(HISAT2),
+                 STRINGTIE = file.exists(STRINGTIE),
+                 FEATURECOUNTS = file.exists(FEATURECOUNTS),
+                 GENOME = file.exists(paste(GENOME, 1:8, "ht2", sep = ".")),
+                 SPLICEFILE = file.exists(SPLICEFILE),
+                 GFF = file.exists(GFF)
+               ))
+if (any(!checks)){
+  message("Stopping markdown compilation: ", names(checks)[!checks], " not found")
+  stop(names(checks)[!checks], " not found")
+}
+message("All file paths are valid")
+```
+
+```{r checkN_CORES, message=TRUE, echo=FALSE}
+message("Checking N_CORES...")
+maxCores <- parallel::detectCores()
+if (bashVars$N_CORES > maxCores){
+  message("The selected number of cores was greater than the available number.\n",
+          "Setting N_CORES to ", ceiling(maxCores/2))
+  bashVars$N_CORES <- ceiling(maxCores/2)
+}
+```
+
+The number of available cores was also checked.
+Processes were set to run on `r bashVars$N_CORES` threads.
+
+```{r bashVars2R, results='hide'}
+names(bashVars) %>%
+  sapply(function(x){
+    assign(x, bashVars[[x]], envir = .GlobalEnv)
+  }, simplify= FALSE)
+```
+
+```{r bashVars2Bash}
+do.call("Sys.setenv", bashVars)
+```
+
+## Define The Directory Structure
+
+```{r dataDirs}
+ROOT <- file.path("/data", "Mouni", "E-MTAB-4634")
+dataDirs <- c(
+  RAW_FASTQ = "raw/fastq", 
+  RAW_FASTQC = "raw/fastQC", 
+  TRIM_FASTQ ="trimmed/fastq", 
+  TRIM_FASTQC = "trimmed/fastQC", 
+  ALN_BAM = "aligned/bam", 
+  ALN_LOGS = "aligned/logs",
+  STRNG_GTF = "stringtie/gtf") %>%
+  lapply(function(x){file.path(ROOT, x)})
+```
+
+```{r createDirs, results='hide'}
+checkDirs <- dataDirs %>% 
+  sapply(function(x){
+    if (file.exists(x)) {
+      message("Directory ", x, " already exists")
+      TRUE
+    }
+    else{
+      message("Creating ", x)
+      dir.create(x, recursive= TRUE)
+    }
+  })
+```
+
+```{r checkDirs, message=TRUE, echo=FALSE}
+message("Checking directories...")
+if (any(!checkDirs)){
+  message("Stopping markdown compilation: ", names(checkDirs)[!checkDirs], " unavailable")
+  stop(names(checkDirs)[!checkDirs], " unavailable")
+}
+message("All directories exist")
+```
+
+```{r dataDirs2R, results='hide'}
+names(dataDirs) %>%
+  sapply(function(x){
+    assign(x, dataDirs[[x]], envir = .GlobalEnv)
+  }, simplify= FALSE)
+```
+
+```{r dataDirs2Bash}
+do.call("Sys.setenv", dataDirs)
+Sys.setenv(ROOT = ROOT)
+```
+
+# Introduction
+
+## Description Of Sample Data
+
+This analysis uses the files associated with:  
+
+Hill, C. B. et al. *De novo transcriptome assembly and analysis of differentially expressed genes of two barley genotypes reveal root-zone-specific responses to salt exposure.* Sci. Rep. **6**, 31558; doi: 10.1038/srep31558 (2016).
+
+
+This analysis deals with the samples from the E-MTAB-4634 dataset from ArrayExpress (https://www.ebi.ac.uk/arrayexpress/experiments/E-MTAB-4634/).
+The complete descriptive file was loaded to find all descriptive information about the samples
+
+
+```{r allSamples}
+sdrfUrl <- "https://www.ebi.ac.uk/arrayexpress/files/E-MTAB-4634/E-MTAB-4634.sdrf.txt"
+allSamples <- sdrfUrl %>%
+  read_delim(delim = "\t") %>%
+  dplyr::select(Source = `Source Name`,
+                Genotype = `Characteristics[genotype]`,
+                Zone = `Characteristics[organism part]`,
+                Treatment = `Factor Value[compound]`,
+                Assay = `Assay Name`,
+                ENA_EXPERIMENT = `Comment[ENA_EXPERIMENT]`,
+                fqFileName = `Scan Name`,
+                ENA_RUN = `Comment[ENA_RUN]`,
+                ftpAddress = `Comment[FASTQ_URI]`)
+```
+
+A summary of the complete set of files from the repository is given in the table below:
+
+```{r, echo=FALSE, results='markup'}
+allSamples %>% 
+  group_by(Genotype, Zone, Treatment) %>% 
+  tally %>%
+  pander(caption = "Summary of samples based on genotype, root tissue and treatment",
+         justify = "left",
+         style = "rmarkdown")
+```
+
+For analysis, only the files from the `Root maturation zone` will be required.
+NB: These entries were redefined on the document `r sdrfUrl` after the initial analysis to be the `root diferentiation zone`.
+As such the string `Z3` within the `Source` field was used to subset the dataset appropriately.
+
+```{r filterAllSamples}
+allSamples %<>% filter(grepl("Z3", Source))
+```
+
+In addition, the entries in the field `Treatment` were changed in the source document from `NaCl` to `sodium chloride`.
+The object `allSamples` was changed such that the values were recorded as `Control` and `NaCl` in keeping with the original metadata.
+The description of the genotype Sahara had also been changed from `Sahara` to `Sahare 3771` but this didn't create any conflicts with the code as was left un-modified.
+
+```{r}
+allSamples %<>% 
+  mutate(Treatment = str_replace(Treatment, "control", "Control"),
+         Treatment = str_replace(Treatment, "sodium chloride", "NaCl"),
+         Treatment = str_trim(Treatment))
+```
+
+
+All samples were run on the Illumina HiSeq, and were broken into 4 sub-files `L001` to `L004` for each sample in each pair.
+In total this gave 4 plants from each treatment, for each genotype, each with paired-end reads.
+
+```{r, echo=FALSE, results='markup'}
+allSamples %>%
+  group_by(Source, ENA_EXPERIMENT, Genotype, Treatment) %>%
+  summarise(`Total Sub-Files` = n()/2) %>%
+  pander(caption = "Summary of samples from the root maturation zone",
+         justify = "left",
+         style = "rmarkdown")
+```
+
+An additional object summarising the metadata for each sample was built.
+
+```{r}
+targets <- allSamples %>%
+  distinct(Source, .keep_all = TRUE) %>%
+  dplyr::select(Source, Genotype, Treatment) %>%
+  mutate(Replicate = str_replace(Source, ".+_.+-", ""))
+```
+
+## Description Of Genome Data
+
+In addition to the samples, the reference genome was obtained from ftp://ftp.ensemblgenomes.org/pub/plants/release-34/fasta/hordeum_vulgare/dna/Hordeum_vulgare.ASM32608v1.dna.toplevel.fa.gz on 15th Dec, 2016.
+
+The associated GFF file was also obtained from ftp://ftp.ensemblgenomes.org/pub/plants/release-34/gff3/hordeum_vulgare/Hordeum_vulgare.ASM32608v1.34.gff3.gz
+
+# Data Downloads and Processing
+
+## Data Downloads
+
+The `ftp`addresses for these files were then noted and the files downloaded.
+Files were estimated at being 700Mb per sub-file, and the total HDD space required was `r round(16*4*700/1024, 0)`Gb.
+As this was deemed viable on the local machine, these were downloaded.
+
+```{r downloadFQ, eval=FALSE}
+allSamples %>% 
+  split(f = .$fqFileName) %>%
+  lapply(function(x){
+    if (!file.exists(file.path(dataDirs$RAW_FASTQ, x$fqFileName))){
+      message("Downloading ", x$fqFileName)
+      download.file(x$ftpAddress, file.path(dataDirs$RAW_FASTQ, x$fqFileName))
+    }
+    else{
+      message(x$fqFileName, " already exists")
+    }
+  })
+```
+
+# Data Processing
+
+## Merged Files
+
+The files were downloaded as 4 smaller files for each sample, and after trimming these were merged to form a single large `fastq` file for each sample.
+
+```{r mergeFastq, eval = FALSE}
+allFastq <- data_frame(files = list.files(dataDirs$RAW_FASTQ, 
+                                          pattern = "fastq.gz", 
+                                          full.names = TRUE),
+                       sample = gsub("L00[1-9]_", "", files))
+allFastq %>%
+  split(f = .$sample) %>%
+  lapply(function(x){
+    args <- paste(x$files, collapse = " ") %>% paste(">", x$sample[1])
+    system2("cat", args)
+  })
+```
+
+Once these were verified, the original files were manually moved to `phoenix.adelaide.edu.au`
+
+### FastQC
+
+QC checks were then run on all files using `r system2("fastqc", "-version")`.
+Note the bash variables below were defined above using `do.call()`.
+
+```{r fastqc, engine='bash', eval=FALSE}
+fastqc -o $RAW_FASTQC \
+  --casava \
+  -t $N_CORES \
+  $RAW_FASTQ/*
+```
+
+
+```{r rawFqcPlot, echo=FALSE, include=FALSE, fig.height=7, fig.width=9, fig.cap="FastQC summaries for the raw data after merging of the original `fastq` files."}
+fastqcSummaryPlot(qcDir = RAW_FASTQC) +
+  theme(plot.title = element_text(hjust = 0.5)) 
+```
+
+
+```{r rawFiles}
+rawFiles <- list(R1 = list.files(RAW_FASTQC, pattern = "R1.+html"),
+                 R2 = list.files(RAW_FASTQC, pattern = "R2.+html")) %>%
+  lapply(str_replace, pattern = "_fastqc.html", replacement = "")
+```
+
+```{r plotRawQuals}
+p1 <- plotReadQualities(RAW_FASTQC, fqNames = rawFiles$R1)
+p2 <- plotReadQualities(RAW_FASTQC, fqNames = rawFiles$R2)
+```
+
+```{r, echo=FALSE, fig.cap = "Merged Quality Scores for all raw fastq files."}
+grid.newpage()
+vp1 <- viewport(x = 0.5, y = 0.5, width = 1, height = 0.45, just = "bottom")
+vp2 <- viewport(x = 0.5, y = 0, width = 1, height = 0.45, just = "bottom")
+print(p1, vp = vp1)
+print(p2, vp = vp2)
+grid.text("All Merged R1 Files", x = 0.5, y = 0.975)
+grid.text("All Merged R2 Files", x = 0.5, y = 0.475)
+```
+
+
+```{r rawReadNumbers}
+rawReadNumbers <- fastqcBasic(qcDir = RAW_FASTQC) %>%
+  mutate(Source = str_extract(Filename, ".+_.+-[1-4]"),
+         ReadPair = str_extract(Filename, "R[12]"),
+         Barcode = gsub(".+_Z3-[1-4]_C4RGUACXX_(.+)_R[12].+", "\\1", Filename)) %>%
+  left_join(targets) %>%
+  dplyr::select(Filename, ReadPair, Barcode, Total.Sequences, one_of(colnames(targets))) %>%
+  tbl_df()
+```
+
+
+Read summaries were then obtained from the FastQC output, and reads were noted to be `r unique(rawReadNumbers$Sequence.length)`_nt_ long.
+
+```{r, echo=FALSE, include=TRUE, results='markup'}
+rawReadNumbers %>%
+  dplyr::select(Filename, Source, Barcode, ReadPair, Total = Total.Sequences) %>%
+  mutate(Total = comma(Total)) %>%
+  pander(caption = "Read Totals for merged fastq files",
+         split.tables = Inf,
+         justify = "left",
+         style = "rmarkdown")
+```
+
+```{r, echo=FALSE, include=TRUE, results='markup', eval=FALSE, fig.cap="Total read numbers for each sample."}
+rawReadNumbers %>%
+  distinct(Source, .keep_all = TRUE) %>%
+  ggplot(aes(x = Replicate, y = Total.Sequences/1e06, fill = Treatment)) +
+  geom_bar(stat = "identity", alpha = 0.6) +
+  scale_fill_manual(values = c(rgb(0.2, 0.2, 0.8), rgb(0.8, 0.2, 0.2))) +
+  facet_grid(Treatment~Genotype) +
+  guides(fill = FALSE) +
+  labs(y = "Total Paired Reads (millions)") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+Read pairs were also checked for validity:
+
+```{r checkrawReadPairs, echo=FALSE, message=TRUE}
+rawReadNumbers %>% 
+  split(f = .$Source) %>% 
+  vapply(function(x){diff(x$Total.Sequences) == 0}, logical(1)) %>%
+  stopifnot()
+message("RawData: All read pairs have matching read numbers")
+```
+
+
+## Trimming
+
+Trimming was performed using `AdapterRemoval`, followed by another round of FastQC.
+
+```{r adapterRemoval, engine='bash', eval=FALSE}
+for FQGZ in ${RAW_FASTQ}/*R1*.fastq.gz
+
+do
+  BNAME=$(basename $FQGZ)
+  AdapterRemoval --file1 $FQGZ --file2 ${FQGZ/R1/R2} \
+    --output1 $TRIM_FASTQ/${BNAME%_R1*}_trim_R1.fastq.gz \
+    --output2 $TRIM_FASTQ/${BNAME%_R1*}_trim_R2.fastq.gz \
+    --threads $N_CORES \
+    --gzip \
+    --trimqualities \
+    --trimns \
+    --minquality 10 \
+    --minlength 35
+done
+
+fastqc -o $TRIM_FASTQC \
+  -t $N_CORES \
+  $TRIM_FASTQ/*
+```
+
+### FastQC
+
+#### Summary Plot
+
+```{r trimFqcPlot, echo=FALSE, include=FALSE, fig.height=7, fig.width=9, fig.cap="FastQC summaries for the raw data after trimming the original `fastq` files."}
+fastqcSummaryPlot(qcDir = TRIM_FASTQC, xLabLen = 9) +
+  theme(axis.text.x = element_text(angle = 90)) 
+```
+
+```{r trimFiles}
+trimFiles <- list(R1 = list.files(TRIM_FASTQC, pattern = "R1.+html"),
+                 R2 = list.files(TRIM_FASTQC, pattern = "R2.+html")) %>%
+  lapply(str_replace, pattern = "_fastqc.html", replacement = "")
+```
+
+#### Quality Scores
+
+```{r plotTrimQuals}
+p1 <- plotReadQualities(TRIM_FASTQC, fqNames = trimFiles$R1)
+p2 <- plotReadQualities(TRIM_FASTQC, fqNames = trimFiles$R2)
+```
+
+```{r, echo=FALSE, fig.cap = "Merged Quality Scores for all trimmed fastq files."}
+grid.newpage()
+vp1 <- viewport(x = 0.5, y = 0.5, width = 1, height = 0.45, just = "bottom")
+vp2 <- viewport(x = 0.5, y = 0, width = 1, height = 0.45, just = "bottom")
+print(p1, vp = vp1)
+print(p2, vp = vp2)
+grid.text("All Trimmed R1 Files", x = 0.5, y = 0.975)
+grid.text("All Trimmed R2 Files", x = 0.5, y = 0.475)
+```
+
+#### Sequence Duplication
+
+```{r plotTrimDups}
+p1 <- plotDuplicationLevels(TRIM_FASTQC, fqNames = trimFiles$R1)
+p2 <- plotDuplicationLevels(TRIM_FASTQC, fqNames = trimFiles$R2)
+```
+
+```{r, echo=FALSE, fig.cap = "Merged duplication levels for all trimmed fastq files."}
+grid.newpage()
+vp1 <- viewport(x = 0.5, y = 0.5, width = 0.97, height = 0.45, just = "bottom")
+vp2 <- viewport(x = 0.5, y = 0, width = 0.97, height = 0.45, just = "bottom")
+print(p1, vp = vp1)
+print(p2, vp = vp2)
+grid.text("All Trimmed R1 Files", x = 0.5, y = 0.975)
+grid.text("All Trimmed R2 Files", x = 0.5, y = 0.475)
+```
+
+```{r trimReadNumbers}
+trimReadNumbers <- fastqcBasic(qcDir = TRIM_FASTQC) %>%
+  mutate(Source = str_extract(Filename, ".+_.+-[1-4]"),
+         ReadPair = str_extract(Filename, "R[12]"),
+         Barcode = gsub(".+_Z3-[1-4]_C4RGUACXX_(.+)_trim_R[12].+", "\\1", Filename)) %>%
+  left_join(targets) %>%
+  dplyr::select(Filename, ReadPair, Barcode, Total.Sequences, one_of(colnames(targets))) %>%
+  tbl_df()
+```
+
+
+Read summaries were then obtained from the FastQC output, and reads were noted to be `r unique(trimReadNumbers$Sequence.length)`_nt_ long.
+
+```{r, echo=FALSE, include=TRUE, results='markup'}
+trimReadNumbers %>%
+  dplyr::select(Filename, Source, Barcode, ReadPair, Total = Total.Sequences) %>%
+  mutate(Total = comma(Total)) %>%
+  pander(caption = "Read Totals for trimmed fastq files",
+         split.tables = Inf,
+         justify = "left",
+         style = "rmarkdown")
+```
+
+```{r, echo=FALSE, include=TRUE, results='markup', fig.cap="Total read numbers for each sample before and after trimming.", fig.height=7, fig.width=8}
+rawReadNumbers %>%
+  dplyr::select(Source, Barcode, ReadPair, Raw = Total.Sequences) %>%
+  left_join(dplyr::select(trimReadNumbers,
+                          Source, Barcode, ReadPair, Trimmed = Total.Sequences)) %>%
+  filter(ReadPair == "R1") %>%
+  melt(id.vars = c("Source", "Barcode", "ReadPair"),
+                  variable.name = "Library",
+                  value.name = "Total") %>%
+  mutate(Genotype = if_else(substr(Source, 1, 1) == "C",
+                            "Clipper", "Sahara"),
+         Treatment = if_else(substr(Source, 2, 2) == "0",
+                             "Control", "Salt"),
+         Replicate = gsub(".+_Z.-(.)", "\\1", Source)) %>%
+  ggplot(aes(x = Replicate, y = Total/1e06, fill = Library)) +
+  geom_bar(stat = "identity", alpha = 0.6, position = "dodge") +
+  scale_fill_manual(values = c(rgb(0.2, 0.2, 0.8), rgb(0.8, 0.2, 0.2))) +
+  facet_grid(Treatment~Genotype) +
+  labs(y = "Total Paired Reads (millions)") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+Read pairs were again checked for validity:
+
+```{r checkTrimReadPairs, echo = FALSE, message=TRUE}
+trimReadNumbers %>% 
+  split(f = .$Source) %>% 
+  vapply(function(x){diff(x$Total.Sequences) == 0}, logical(1)) %>%
+  stopifnot()
+message("TrimmedData: All read pairs have matching read numbers")
+```
+
+
+## Alignments
+
+Alignment was then performed using `hisat2-2.0.4`
+
+```{r alignment, engine='bash', eval = FALSE}
+for FQGZ in $TRIM_FASTQ/*R1.fastq.gz
+do 
+
+  echo Aligning $FQGZ to $GENOME
+  BNAME=$(basename $FQGZ)
+  logname=${BNAME%_trim*}_hisat2.log
+  $HISAT2 \
+    -p $N_CORES \
+    -x $GENOME \
+    --known-splicesite-infile $SPLICEFILE \
+    -1 $FQGZ \
+    -2 ${FQGZ/R1/R2} 2> $ALN_LOGS/$logname | \
+    $SAMTOOLS view -bhS -q30 - 1> $ALN_BAM/${BNAME%_trim*}.bam 
+  
+  sambamba sort -p -t $N_CORES \
+    -o $ALN_BAM/${BNAME%_trim*}_sorted.bam \
+    $ALN_BAM/${BNAME%_trim*}.bam
+  
+  rm $ALN_BAM/${BNAME%_trim*}.bam
+
+done
+```
+
+### Summary Of Alignments
+
+```{r alignmentStats}
+alignmentStats <- list.files(ALN_LOGS, full.names = TRUE) %>%
+  lapply(readHisat2Log) %>%
+  bind_rows() %>%
+  mutate(Source = str_extract(File, ".+_.+-[1-4]")) %>%
+  left_join(targets) %>%
+  mutate(Total = 2*PairedReads,
+         Unique = 2*UniqueInPairs + 2*UniqueDiscordantPairs + UniqueUnpaired,
+         Multiple = 2*MultipleInPairs + MultipleUnpaired) 
+```
+
+`r percent(1-with(alignmentStats, sum(NotAligned)/sum(Total)))` aligned across all samples with alignment rates within each sample ranging from `r percent(min(alignmentStats$AlignmentRate))` to `r percent(max(alignmentStats$AlignmentRate))`
+
+
+```{r plotAlignmentStats, fig.cap = "Total read numbers before and after alignment. Each read within a pair is counted separately."}
+alignmentStats %>%
+  dplyr::select(one_of(colnames(targets)), Total, Unique, Multiple, NotAligned) %>%
+  melt(id.vars = colnames(targets),
+       variable.name = "AlignmentType",
+       value.name = "Total") %>%
+  ggplot(aes(x = Replicate, y = Total/1e06, fill = AlignmentType)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_grid(Treatment~Genotype) +
+  theme_bw()
+```
+
+# Differential Expression Analysis
+
+## Stringtie: Creation of a custom GTF File
+
+The GFF files obtained from Ensembl was restricted to transcripts on the known chromosomes, and this set of transcripts were added to using the tool StringTie `r system2("stringtie", "--version", stdout = TRUE)`.
+
+```{r, engine='bash', eval = FALSE}
+for BAM in $ALN_BAM/*_sorted.bam
+do
+	BNAME=$(basename $BAM)
+	$STRINGTIE \
+	  -p $N_CORES \
+	  -m 30 \
+	  -G $GFF \
+	  -o $STRNG_GTF/${BNAME%_sorted.bam}_assembly.gtf \
+	  -A $STRNG_GTF/${BNAME%_sorted.bam}_gene_abund.tab \
+	  -C $STRNG_GTF/${BNAME%_sorted.bam}_cov_refs.gtf \
+	  $BAM
+done
+
+# NB: This is currently ignoring the -p $N_CORES setting
+#    Manually checking core useage has only one thread active
+
+GTF_FILES=$(ls $STRNG_GTF/*assembly.gtf)
+MERGED_GTF=${GFF%gff3}merged.gtf
+
+$STRINGTIE --merge \
+  -G $GFF \
+  -o $MERGED_GTF \
+  $GTF_FILES
+```
+
+
+```{r setMERGED_GTF}
+MERGED_GTF <- list.files(dirname(GFF), pattern = "merged.gtf", full.names = TRUE)
+if (length(MERGED_GTF) != 1) stop("Ambiguous or missing merged gtf")
+Sys.setenv(MERGED_GTF = MERGED_GTF)
+```
+
+
+## Counting Of Reads
+
+The final `gtf` as created by `String Tie` was then used to assign reads to genes, using `featureCounts` run from `bash` as the dataset was too large to be handled by `Rsubread`.
+The version used was `r system2(FEATURECOUNTS, "-v", stdout = TRUE, stderr = TRUE)[2]`
+
+As this data contined paired end reads, the parameters were set to only count fragments (i.e. template molecules), instead of individual reads.
+
+```{r featCounts, engine='bash', eval=FALSE}
+BAMFILES=$(ls $ALN_BAM/*sorted.bam)
+$FEATURECOUNTS -F GTF -Q 10 -s 0 -p -T $N_CORES -a $MERGED_GTF -o $ROOT/allSamples.counts $BAMFILES
+```
+
+```{r counts}
+geneCols <- c("Geneid", "Chr", "Start", "End", "Strand", "Length")
+counts <- file.path(ROOT, "allSamples.counts") %>%
+  read_delim(delim= "\t", skip = 1) %>%
+  filter(!is.na(Geneid))
+names(counts) %<>% str_extract(
+  paste0("(", 
+         paste(c(geneCols, targets$Source), collapse = "|"),
+         ")")
+)
+```
+
+```{r dge}
+dge <- counts %>%
+  dplyr::select(one_of(targets$Source)) %>%
+  as.matrix() %>% 
+  set_rownames(counts$Geneid) %>% 
+  DGEList(genes = dplyr::select(counts, one_of(geneCols)) %>%
+            dplyr::rename(GeneID = Geneid) %>% 
+            mutate(Chr = gsub("([^;]+);.+", "\\1", Chr),
+                   Start = gsub("([0-9]+);.+", "\\1", Start),
+                   End = gsub(".+;([0-9]*)", "\\1", End),
+                   Strand = substr(Strand, 1, 1)),
+          samples = targets) %>%
+  calcNormFactors()
+```
+
+```{r dgeSample}
+dge$samples$group %<>% 
+  str_replace("-[1-4]", "") %>%
+  as.factor()
+```
+
+Counts were loaded as a `DGEList` object with `r nrow(dge)` genes.
+Normalising factors were also calculated to account for variation in the library sizes.
+The correct groupings were also defined by removing the replicate number from the `Source` column and defining these values in the `group` field.
+
+```{r, echo=FALSE, results='markup'}
+dge$samples %>%
+  dplyr::select(Group = group, Replicate, Genotype, Treatment, 
+                `Library Size` = lib.size, 
+                `Norm. Factors` = norm.factors) %>%
+  mutate(`Library Size` = comma(`Library Size`)) %>%
+  pander(caption = "Summary of library sizes and normalising factors.",
+         justify = "lrllrr",
+         style = "rmarkdown")
+```
+
+## Gene Filtering
+
+The dataset was also filtered such that only genes with a $CPM > 0.5$ in at least four samples were retained.
+This approximately equates to genes with $>8$ fragments in each of the Sahara NaCl samples, or genes with $>10$ fragments in the other samples.
+
+```{r genes2Keep}
+genes2Keep <- rowSums(cpm(dge) > 0.5) > 4
+dge <- dge[genes2Keep, , keep.lib.sizes = FALSE]
+```
+
+This filtering removed `r comma(sum(!genes2Keep))` genes from the dataset, with the remaining `r comma(sum(genes2Keep))` being used for differential expresson analysis.
+
+An additional step was performed to ensure that only genes on chromosomes 1 to 7 wre included for differential expression analysis.
+
+```{r geesOnChr}
+genesOnChr <- dge$genes$Chr %in% 1:7
+dge <- dge[genesOnChr, , keep.lib.sizes = FALSE]
+```
+
+This removed a further `r comma(sum(!genesOnChr))` genes, leaving a final total of `r comma(sum(genesOnChr))` genes for analysis of differential expression.
+Final library sizes ranged from `r paste(comma(range(dge$samples$lib.size)), collapse = " to ")`.
+
+## Data Inspection
+
+```{r glimmaMDS, eval=FALSE}
+Glimma::glMDSPlot(dge, groups = dge$samples$group)
+```
+
+```{r mds, results='hide'}
+mds <- plotMDS.DGEList(dge, plot = FALSE)
+```
+
+```{r plotMDS, echo=FALSE, fig.height=5, fig.width=5, fig.cap = "MDS plot for all samples"}
+# The plotting co-ordinates are in the 3rd component
+mds@.Data[[3]] %>%
+  set_colnames(c("x", "y")) %>%
+  as.data.frame() %>%
+  rownames_to_column("Source") %>%
+  left_join(targets) %>%
+  mutate(Source = gsub("_Z3", "", Source)) %>%
+  ggplot(aes(x = x, y = y, colour = Treatment)) +
+  geom_point(aes(shape = Genotype), size = 3) +
+  geom_text_repel(aes(label = Source)) +
+  theme_bw() +
+  labs(x = "Leading logFC dim 1",
+       y = "Leading logFC dim 2")
+```
+
+Inspection of the MDS plot revealed that the genotype was the primary source of variation between the sample groups.
+Treatment with `NaCl` clearly impacted the gene expression profiles, however there was considerable overlap between the groups based on this variable.
+One Sahara Control sample (`S0-3`) clustered more closely with the salt treated samples, whilst one Sahara salt-treated sample clustered more closely with control samples (`S100-4`).
+This pattern often indicates a sample mis-labelling, however the similar patterns observed in the Clipper samples implies that this is not likely to be of concern for this dataset.
+
+## Comparison of samples
+
+A simple design matrix was formed such that a separate baseline expression level was formed for each genotype, with a common effect being modelled as a response to salt exposure.
+This will give the 3rd coefficient in any top tables as the one of interest, with the coefficient name as `NaCl`
+
+```{r designMatrix}
+designMatrix <- model.matrix(~ 0 + Genotype + Treatment, 
+                             data = targets) %>%
+  set_colnames(gsub("(Genotype|Treatment)", "", colnames(.)))
+```
+
+Differential gene expression was then estimated using `limma::voom`, and differentially expressed genes were found.
+These were defined as have a fold-change $> \pm 2$ (i.e. |logFC| > 1), with an FDR adjusted $p$-value $<0.05$
+
+```{r fit}
+fit <- voom(dge, designMatrix) %>%
+  lmFit(designMatrix) %>%
+  eBayes()
+```
+
+```{r, echo=FALSE, results='markup'}
+decideTests(fit, lfc = 1, p.value = 0.05) %>% 
+  summary %>%
+  extract(, "NaCl") %>%
+  set_names(c("Down", "Unchanged", "Up")) %>%
+  pander(caption = "Results from Initial Differential Expression Analysis")
+```
+
+```{r deGenes}
+deGenes <- decideTests(fit, lfc = 1, p.value = 0.05) %>%
+  extract(,"NaCl") %>%
+  abs %>%
+  is_greater_than(0) 
+```
+
+The top DE genes were given as:
+
+```{r topDE}
+topDE <- topTable(fit, coef = "NaCl", 
+                  number = nrow(dge), sort.by = "none") %>%
+  extract(deGenes,) %>%
+  arrange(P.Value) %>%
+  dplyr::select(-Strand, -Length, -B) %>%
+  as_tibble()
+```
+
+```{r, echo=FALSE}
+topDE %>%
+  dplyr::slice(1:10) %>%
+  dplyr::rename(FDR = adj.P.Val) %>%
+  pander(caption = paste("Top", nrow(.), "DE genes"),
+         split.tables = Inf)
+```
+
+
+```{r, echo=FALSE, fig.cap = "DE Genes as  a response to NaCl treatment"}
+plotMD(fit, 
+       status = deGenes, 
+       legend = FALSE,
+       main = c())
+```
+
+```{r glimmaMDPlot, eval = FALSE}
+# Some logCPM values are not being generated correctly
+Glimma::glMDPlot(fit, 
+                 counts = cpm(dge, log = TRUE),
+                 anno = dge$genes,
+                 groups = dge$samples$group,
+                 samples = dge$samples$Source,
+                 status = deGenes)
+```
+
+### Inspection of fold-change for the top DE Genes
+
+As a check on the accuracy of the results, the counts for the topDE genes were transformed using logCPM, and these were plotted to verify estimates of fold-change.
+No unusual behaviour was observed.
+
+```{r, echo=FALSE, fig.cap = "Top 10 genes up-regulated in response to salt treatment."}
+dge %>%
+  cpm(log = TRUE) %>%
+  extract(filter(topDE, logFC > 0)$GeneID[1:10],) %>%
+  melt %>%
+  set_names(c("GeneID", "Source", "logCPM")) %>%
+  left_join(targets) %>%
+  ggplot(aes(x = Treatment, y = logCPM, colour = Genotype)) +
+  geom_jitter(width = 0.2) +
+  facet_wrap(~GeneID, scales = "free_y") +
+  theme_bw() +
+  theme(legend.position = c(0.75, 0.1),
+        legend.direction = "horizontal")
+```
+
+```{r, echo=FALSE, fig.cap = "Top 10 genes down-regulated in response to salt treatment."}
+dge %>%
+  cpm(log = TRUE) %>%
+  extract(filter(topDE, logFC < 0)$GeneID[1:10],) %>%
+  melt %>%
+  set_names(c("GeneID", "Source", "logCPM")) %>%
+  left_join(targets) %>%
+  ggplot(aes(x = Treatment, y = logCPM, colour = Genotype)) +
+  geom_jitter(width = 0.2) +
+  facet_wrap(~GeneID, scales = "free_y") +
+  theme_bw() +
+  theme(legend.position = c(0.75, 0.1),
+        legend.direction = "horizontal")
+```
+
+### Creation of GRanges object for DE Genes
+
+For plotting of alignments and comparison with the differential methylation markers (DMMs), the set of DE genes was formed into a GRanges object, as was the complete set of genes contained in the DE analysis.
+
+The sequence information was initially loaded and formed in a `seqinfo` object.
+
+```{r seqDf}
+seqDf <- file.path(dirname(GENOME),
+                   "Hordeum_vulgare.ASM32608v1.summary.txt") %>%
+  read_delim(delim = "\t", skip = 5, col_names = FALSE, col_types = "-ci") %>%
+  set_names(c("Info", "Length")) %>%
+  mutate(Info = gsub(" REF", "", Info),
+         Info = gsub(".+ dna:(chromosome chromosome|contig contig):ASM32608v1:", "", Info),
+         chromosome = gsub("(.*):1:.+", "\\1", Info)) %>%
+  dplyr::select(chromosome, length = Length) %>%
+  filter(!is.na(length),
+         chromosome %in% as.character(1:7)) %>%
+  as.data.frame() 
+hvSeqInfo <- Seqinfo(seqnames = seqDf$chromosome, 
+                   seqlengths = seqDf$length, 
+                   isCircular = rep(FALSE, 7), 
+                   genome = "ASM32608v1")
+```
+
+Subsequently, the merged gtf used by feature counts was used to form a `GRangesList` object, where each gene is a distinct `GRanges` object containing the exons for all associated transcripts.
+
+```{r allGeneGR}
+gtfCols <- c("source", "gene_id", "transcript_id", "exon_number", 
+             "ref_gene_id", "gene_name")
+allGeneGR <- import.gff(MERGED_GTF,
+                       genome = basename(GENOME),
+                       feature.type = "exon",
+                       colnames = gtfCols) %>%
+  split(f = .$gene_id) %>%
+  extract(names(.) %in% dge$genes$GeneID) %>%
+  keepSeqlevels(as.character(1:7))
+seqinfo(allGeneGR) <-hvSeqInfo
+```
+
+Finally, the set of DE genes was converted to a `GRanges` object
+
+```{r topDEGR}
+topDEGR <- makeGRangesFromDataFrame(topDE, 
+                                    seqinfo = hvSeqInfo,
+                                    seqnames.field = "Chr",
+                                    keep.extra.columns = TRUE) %>%
+  set_names(mcols(.)$GeneID)
+```
+
+The list of DE genes was also exported as a csv, noting any `MLOC` defined genes in the set.
+
+```{r}
+topDE  %>%
+  mutate(ref_gene_id = allGeneGR[GeneID] %>% 
+           lapply(function(x){unique(mcols(x)$ref_gene_id)}) %>% 
+           lapply(na.omit) %>% 
+           lapply(str_replace, "gene:", "") %>% 
+           vapply(paste, collapse = ":", character(1))) %>%
+  dplyr::select(contains("gene"), everything()) %>%
+  write_csv("topDERoot.csv")
+```
+
+
+
+### Inspection of alignments to transcripts
+
+TODO
+
+
+
+
+# Comparison with DMMs
+
+## Loading the DMM objects
+
+```{r dmmGR}
+dmmGR <- list(ComDMMsRoot.hyper = "ComDMMsRoot.hyper.txt",
+              ComDMMsRoot.hypo = "ComDMMsRoot.hypo.txt") %>%
+  lapply(function(x){
+    gr <- read.delim(x, header = FALSE, sep = "\t") %>%
+      set_names(c("Chr", "BP", "BP+1")) %>%
+      mutate(Chr = gsub("Chr", "", Chr),
+             strand = ".") %>%
+      makeGRangesFromDataFrame(ignore.strand = TRUE,
+                               seqnames.field = "Chr",
+                               start.field = "BP",
+                               end.field ="BP")
+    mcols(gr) <- data.frame(Type = gsub("ComDMMsRoot.(hyper|hypo).txt", "\\1", x))
+    gr
+  }) %>%
+  GRangesList() %>%
+  unlist() %>%
+  set_names(c())
+```
+
+The objects containing the hyper- and hypo-methylated markers were loaded as a `GRanges`, then an expanded version was formed by increasing each range by 5kb in both directions.
+
+```{r dmmPlus5kbGR}
+dmmPlus5kbGR <- resize(dmmGR, width = 10001, fix ="center")
+```
+
+## Comparison to DE genes
+
+The list of markers wwas then compared to the DE genes, but no DE genes were found within 5kb of any DMM.
+
+```{r countOverlaps}
+countOverlaps(dmmPlus5kbGR, topDEGR, type = "any") %>% sum()
+```
+
+The ranges were then expanded to be any genes with 10kb of a DMM, with no results.
+
+```{r}
+dmmGR %>%
+  resize(width = 20001, fix = "center") %>%
+  countOverlaps(topDEGR, type = "any") %>%
+  sum()
+```
+
+The nearest DE gene to each DMM was then found.
+
+```{r}
+dmm2DE <- distanceToNearest(unlist(dmmGR), topDEGR) 
+```
+
+```{r}
+mcols(dmmGR) <- DataFrame(Type = mcols(dmmGR)$Type,
+                          nearestDEGene = mcols(topDEGR)$GeneID[subjectHits(dmm2DE)],
+                          distance = mcols(dmm2DE)$distance,
+                          logFC = mcols(topDEGR)$logFC[subjectHits(dmm2DE)])
+```
+
+```{r}
+dmmGR[order(dmmGR$distance)]%>% 
+  as.data.frame() %>%
+  filter(distance < 100000) %>%
+  dplyr::select(Chr = seqnames,
+                BP = start,
+                Type,
+                `Nearest DE Gene` = nearestDEGene,
+                Distance = distance,
+                logFC) %>%
+  pander(caption = "DMMs with the closest DE genes shown. Only the DMMs within 100kb of a DE gene are included",
+         justify = "lrllrr",
+         style = "rmarkdown",
+         big.mark = ",")
+```
+
+## Comparison to all genes
+
+As an alternative approach, the DMMs were checked to find those within 5kb of any genes.
+
+```{r dmm2All}
+dmm2All <- dmmGR %>%
+  resize(width = 10001, fix = "center") %>%
+  findOverlaps(range(allGeneGR), type  = "any")
+```
+
+A total of `r length(dmm2All)` of the `r length(dmmGR)` DMMs were found within this proximity to a gene.
+
+```{r}
+dmm5kbGenes <- range(allGeneGR) %>% 
+  unlist() %>% 
+  names() %>% 
+  extract(subjectHits(dmm2All)) 
+```
+
+These genes were then checked in the list of DE genes to find any which narrowly missed being declared as DE.
+For this inspection, an FDR cutoff of 10% was used to declare a gene as potentially DE.
+
+```{r, echo=FALSE}
+fit %>%
+  topTable(coef = "NaCl", number = nrow(.)) %>%
+  filter(GeneID %in% dmm5kbGenes,
+         abs(logFC) > 1,
+         adj.P.Val < 0.1) %>%
+  dplyr::select(GeneID, Chr, Start, End,
+                logFC, AveExpr, p = P.Value, FDR = adj.P.Val) %>%
+  pander(caption = "Genes within 5kb of a DMM, using an FDR cutoff of 10% and logFC greater than 1 to consider a gene as Differentially Expressed.",
+         justify = "llrrrrrr",
+         style = "rmarkdown",
+         big.mark = ",",
+         split.tables = Inf)
+```
+
+One gene was noted as being only marginally above the previous significance threshold of $p < 0.05$, whilst numerous others were detected as candidates.
+
+This additional list was then refined to incorporate the `logFC` threshold of $\pm 2$ and the previous analysis was repeated.
+
+## Analysis using an FDR of 10%
+
+The association of these genes to the specific DMMs was then checked in order to correctly assess any relationship between DE & DMMs.
+
+```{r deGenes_FDR10}
+deGenes_FDR10 <- decideTests(fit, lfc = 1, p.value = 0.1) %>%
+  extract(,"NaCl") %>%
+  abs %>%
+  is_greater_than(0) 
+```
+
+Firstly a vector was prepared of the `r comma(sum(deGenes_FDR10))` genes considered DE under the more inclusive criteria.
+
+
+```{r topDE_FDR10}
+topDE_FDR10 <- topTable(fit, coef = "NaCl", 
+                       number = nrow(dge), sort.by = "none") %>%
+  extract(deGenes_FDR10,) %>%
+  arrange(P.Value) %>%
+  dplyr::select(-Strand, -Length, -B) %>%
+  as_tibble()
+```
+
+
+Secondly a `data_frame` of the DE genes was prepared, containing locational information, as well as differential expression information.
+
+
+```{r topDEGR_FDR10}
+topDEGR_FDR10 <- makeGRangesFromDataFrame(topDE_FDR10, 
+                                          seqinfo = hvSeqInfo,
+                                          seqnames.field = "Chr",
+                                          keep.extra.columns = TRUE) %>%
+  set_names(mcols(.)$GeneID)
+```
+
+Finally, the new set of DE genes was converted to a `GRanges` object for comparison with the DMMs
+
+```{r dmmDE, echo=FALSE}
+dmmDE <- dmmGR %>% 
+  resize(width = 10001, fix = "center") %>%
+  findOverlaps(topDEGR_FDR10, type = "any")
+```
+
+A total of `r length(dmmDE)` DMMs were found to be within 5kb of a DE gene.
+This gave a total of `r  length(unique(subjectHits(dmmDE)))` genes as some were within 5kb of more than one DMM.
+
+This data is given in full below.
+
+```{r results}
+results <- dmmGR[queryHits(dmmDE)]
+mcols(results) <- DataFrame(Type = mcols(results)$Type,
+                            topDEGR_FDR10[subjectHits(dmmDE)])
+mcols(results)$dist2Gene <- 
+  if_else(start(results) > start(results$X),
+          if_else(start(results) < end(results$X), 
+                  0L, abs(start(results) - end(results$X))), 
+          abs(start(results) - start(results$X)))
+results
+```
+
+The transcripts associated with each of these genes are also given as:
+
+```{r, echo=FALSE}
+allGeneGR[results$GeneID] %>% 
+  lapply(mcols) %>% 
+  lapply(extract2, "transcript_id") %>% 
+  lapply(unique) %>% 
+  lapply(str_replace, pattern = "transcript:", replacement = "") %>%
+  lapply(str_replace, pattern = "_", replacement = ".") %>%
+  pander(caption = "Source of transcripts for genes associated with DMMs")
+```
+
+Notably, if a source transcript begins with `MLOC` it was derived from the ensembl annotation.
+Otherwise the transcript was defined using the alignments from this dataset.
+
+# Appendix
+
+```{r save.image, echo=FALSE}
+save.image("DifferentialExpressionRoot.RData")
+```
+
+```{r sessionInfo}
+sessionInfo()
+```
+
